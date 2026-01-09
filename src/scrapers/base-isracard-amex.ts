@@ -54,10 +54,12 @@ interface ScrapedTransaction {
   paymentSumOutbound: number;
 }
 
+// UPDATE: Added billingSum optional property
 interface ScrapedAccount {
   index: number;
   accountNumber: string;
   processedDate: string;
+  billingSum?: string;
 }
 
 interface ScrapedLoginValidation {
@@ -70,6 +72,7 @@ interface ScrapedLoginValidation {
   };
 }
 
+// UPDATE: Added cardsChargesNext and billingSumSekel to the interface
 interface ScrapedAccountsWithinPageResponse {
   Header: {
     Status: string;
@@ -79,6 +82,13 @@ interface ScrapedAccountsWithinPageResponse {
       cardIndex: string;
       cardNumber: string;
       billingDate: string;
+      billingSumSekel?: string;
+    }[];
+    cardsChargesNext?: {
+      cardIndex: string;
+      cardNumber: string;
+      billingDate: string;
+      billingSumSekel?: string;
     }[];
   };
 }
@@ -116,17 +126,37 @@ function getAccountsUrl(servicesUrl: string, monthMoment: Moment) {
   });
 }
 
+// UPDATE: Logic to fetch both Current and Next charges, filter by date, and capture sum
 async function fetchAccounts(page: Page, servicesUrl: string, monthMoment: Moment): Promise<ScrapedAccount[]> {
   const dataUrl = getAccountsUrl(servicesUrl, monthMoment);
   const dataResult = await fetchGetWithinPage<ScrapedAccountsWithinPageResponse>(page, dataUrl);
+  
   if (dataResult && _.get(dataResult, 'Header.Status') === '1' && dataResult.DashboardMonthBean) {
-    const { cardsCharges } = dataResult.DashboardMonthBean;
-    if (cardsCharges) {
-      return cardsCharges.map(cardCharge => {
+    const { cardsCharges, cardsChargesNext } = dataResult.DashboardMonthBean;
+
+    // Combine both lists (safely handling undefined)
+    const allCharges = [
+      ...(cardsCharges || []),
+      ...(cardsChargesNext || [])
+    ];
+
+    if (allCharges.length > 0) {
+      // 1. Filter: Only keep the charge that matches the requested monthMoment
+      // This prevents the "Next" bill from overwriting the "Current" bill or vice-versa
+      const relevantCharges = allCharges.filter(charge => {
+        if (!charge.billingDate) return true; // Keep if no date (fallback)
+        return moment(charge.billingDate, DATE_FORMAT).isSame(monthMoment, 'month');
+      });
+
+      // 2. Map to internal format and include the billing sum
+      return relevantCharges.map(cardCharge => {
         return {
           index: parseInt(cardCharge.cardIndex, 10),
           accountNumber: cardCharge.cardNumber,
-          processedDate: moment(cardCharge.billingDate, DATE_FORMAT).toISOString(),
+          processedDate: cardCharge.billingDate 
+            ? moment(cardCharge.billingDate, DATE_FORMAT).toISOString() 
+            : monthMoment.toISOString(),
+          billingSum: cardCharge.billingSumSekel
         };
       });
     }
@@ -243,10 +273,17 @@ async function fetchTransactions(
         if (options.outputData?.enableTransactionsFilterByDate ?? true) {
           allTxns = filterOldTransactions(allTxns, startMoment, options.combineInstallments || false);
         }
+        
+        // UPDATE: Pass billingSum and billingDate to the result object
+        // Note: We cast to 'any' here or use @ts-ignore because these properties might not exist on the TransactionsAccount type definition yet.
         accountTxns[account.accountNumber] = {
           accountNumber: account.accountNumber,
           index: account.index,
           txns: allTxns,
+          // @ts-ignore
+          billingSum: account.billingSum,
+          // @ts-ignore
+          billingDate: account.processedDate,
         };
       }
     });
@@ -329,6 +366,7 @@ function getExtraScrap(
   return runSerial(actions);
 }
 
+// UPDATE: Aggregates sums into metadata and adds them to final output
 async function fetchAllTransactions(
   page: Page,
   options: ScraperOptions,
@@ -348,6 +386,8 @@ async function fetchAllTransactions(
     : results;
 
   const combinedTxns: Record<string, Transaction[]> = {};
+  // New object to hold the metadata (sums/dates)
+  const combinedMetadata: Record<string, any> = {};
 
   finalResult.forEach(result => {
     Object.keys(result).forEach(accountNumber => {
@@ -356,15 +396,29 @@ async function fetchAllTransactions(
         txnsForAccount = [];
         combinedTxns[accountNumber] = txnsForAccount;
       }
-      const toBeAddedTxns = result[accountNumber].txns;
+      
+      const resultData = result[accountNumber] as any;
+      const toBeAddedTxns = resultData.txns;
       combinedTxns[accountNumber].push(...toBeAddedTxns);
+
+      // If this result has a billingSum, store it.
+      // Since 'finalResult' is ordered by month, the last valid sum we see 
+      // (which will be the "Next" month) will remain in combinedMetadata.
+      if (resultData.billingSum) {
+        combinedMetadata[accountNumber] = {
+          nextBillingSum: resultData.billingSum,
+          nextBillingDate: resultData.billingDate
+        };
+      }
     });
   });
 
   const accounts = Object.keys(combinedTxns).map(accountNumber => {
+    const meta = combinedMetadata[accountNumber] || {};
     return {
       accountNumber,
       txns: combinedTxns[accountNumber],
+      ...meta // Spread the metadata (nextBillingSum, nextBillingDate) into the final account object
     };
   });
 
