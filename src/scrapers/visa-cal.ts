@@ -2,18 +2,30 @@ import moment from 'moment';
 import { type HTTPRequest, type Frame, type Page } from 'puppeteer';
 import { getDebug } from '../helpers/debug';
 import { clickButton, elementPresentOnPage, pageEval, waitUntilElementFound } from '../helpers/elements-interactions';
-import { fetchPostWithinPage } from '../helpers/fetch';
+import { fetchPost } from '../helpers/fetch';
 import { getCurrentUrl, waitForNavigation } from '../helpers/navigation';
 import { getFromSessionStorage } from '../helpers/storage';
 import { filterOldTransactions } from '../helpers/transactions';
 import { waitUntil } from '../helpers/waiting';
 import { TransactionStatuses, TransactionTypes, type Transaction, type TransactionsAccount } from '../transactions';
 import { BaseScraperWithBrowser, LoginResults, type LoginOptions } from './base-scraper-with-browser';
-import { type ScraperScrapingResult } from './interface';
+import { type ScraperScrapingResult, type ScraperOptions } from './interface';
+import _ from 'lodash';
 
+const apiHeaders = {
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+  Origin: 'https://digital-web.cal-online.co.il',
+  Referer: 'https://digital-web.cal-online.co.il',
+  'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Sec-Fetch-Site': 'same-site',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Dest': 'empty',
+};
 const LOGIN_URL = 'https://www.cal-online.co.il/';
 const TRANSACTIONS_REQUEST_ENDPOINT =
   'https://api.cal-online.co.il/Transactions/api/transactionsDetails/getCardTransactionsDetails';
+const FRAMES_REQUEST_ENDPOINT = 'https://api.cal-online.co.il/Frames/api/Frames/GetFrameStatus';
 const PENDING_TRANSACTIONS_REQUEST_ENDPOINT =
   'https://api.cal-online.co.il/Transactions/api/approvals/getClearanceRequests';
 const SSO_AUTHORIZATION_REQUEST_ENDPOINT = 'https://connect.cal-online.co.il/col-rest/calconnect/authentication/SSO';
@@ -148,6 +160,33 @@ interface CardPendingTransactionDetails extends CardTransactionDetailsError {
   statusTitle: string;
 }
 
+interface CardLevelFrame {
+  cardUniqueId: string;
+  nextTotalDebit?: number;
+}
+
+interface FramesResponse {
+  result?: {
+    bankIssuedCards?: {
+      cardLevelFrames?: CardLevelFrame[];
+    };
+  };
+}
+
+interface AuthModule {
+  auth: {
+    calConnectToken: string | null;
+  };
+}
+
+function isAuthModule(result: any): result is AuthModule {
+  return Boolean(result?.auth?.calConnectToken && String(result.auth.calConnectToken).trim());
+}
+
+function authModuleOrUndefined(result: any): AuthModule | undefined {
+  return isAuthModule(result) ? result : undefined;
+}
+
 function isPending(
   transaction: ScrapedTransaction | ScrapedPendingTransaction,
 ): transaction is ScrapedPendingTransaction {
@@ -242,6 +281,7 @@ function createLoginFields(credentials: ScraperSpecificCredentials) {
 function convertParsedDataToTransactions(
   data: CardTransactionDetails[],
   pendingData?: CardPendingTransactionDetails | null,
+  options?: ScraperOptions,
 ): Transaction[] {
   const pendingTransactions = pendingData?.result
     ? pendingData.result.cardsList.flatMap(card => card.authDetalisList)
@@ -291,6 +331,10 @@ function convertParsedDataToTransactions(
       result.installments = installments;
     }
 
+    if (options?.includeRawTransaction) {
+      result.rawTransaction = transaction;
+    }
+
     return result;
   });
 }
@@ -327,7 +371,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       1000,
     );
     if (!initData) {
-      throw new Error("could not find 'init' data in session storage");
+      throw new Error('could not find "init" data in session storage');
     }
     return initData?.result.cards.map(({ cardUniqueId, last4Digits }) => ({ cardUniqueId, last4Digits }));
   }
@@ -336,22 +380,12 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     if (!this.authorization) {
       debug('fetching authorization header');
       const authModule = await waitUntil(
-        async () => {
-          const result = await getFromSessionStorage<{ auth: { calConnectToken: string | null } }>(
-            this.page,
-            'auth-module',
-          );
-          return result && result.auth && result.auth.calConnectToken !== null ? result : null;
-        },
+        async () => authModuleOrUndefined(await getFromSessionStorage<AuthModule>(this.page, 'auth-module')),
         'get authorization header with valid token in session storage',
-        1000,
+        10_000,
         50,
       );
-
-      if (authModule && authModule.auth.calConnectToken !== null) {
-        return `CALAuthScheme ${authModule.auth.calConnectToken}`;
-      }
-      throw new Error('could not retrieve authorization header');
+      return `CALAuthScheme ${authModule.auth.calConnectToken}`;
     }
     return this.authorization;
   }
@@ -396,7 +430,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
             await clickButton(this.page, 'button.btn-close');
           }
           const request = await this.authRequestPromise;
-          this.authorization = request?.headers()?.authorization;
+          this.authorization = String(request?.headers().authorization || '').trim();
         } catch (e) {
           const currentUrl = await getCurrentUrl(this.page);
           if (currentUrl.endsWith('dashboard')) return;
@@ -405,8 +439,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
           throw e;
         }
       },
-      userAgent:
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36',
+      userAgent: apiHeaders['User-Agent'],
     };
   }
 
@@ -424,36 +457,48 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     const futureMonthsToScrape = this.options.futureMonthsToScrape ?? 1;
 
+    debug('fetch frames (misgarot) of cards');
+    const frames = await fetchPost<FramesResponse>(
+      FRAMES_REQUEST_ENDPOINT,
+      { cardsForFrameData: cards.map(({ cardUniqueId }) => ({ cardUniqueId })) },
+      {
+        Authorization,
+        'X-Site-Id': xSiteId,
+        'Content-Type': 'application/json',
+        ...apiHeaders,
+      },
+    );
+
     const accounts = await Promise.all(
       cards.map(async card => {
         const finalMonthToFetchMoment = moment().add(futureMonthsToScrape, 'month');
         const months = finalMonthToFetchMoment.diff(startMoment, 'months');
-
         const allMonthsData: CardTransactionDetails[] = [];
+        const frame = _.find(frames.result?.bankIssuedCards?.cardLevelFrames, { cardUniqueId: card.cardUniqueId });
 
         debug(`fetch pending transactions for card ${card.cardUniqueId}`);
-        let pendingData = await fetchPostWithinPage<CardPendingTransactionDetails | CardTransactionDetailsError>(
-          this.page,
+        let pendingData = await fetchPost(
           PENDING_TRANSACTIONS_REQUEST_ENDPOINT,
           { cardUniqueIDArray: [card.cardUniqueId] },
           {
             Authorization,
             'X-Site-Id': xSiteId,
             'Content-Type': 'application/json',
+            ...apiHeaders,
           },
         );
 
         debug(`fetch completed transactions for card ${card.cardUniqueId}`);
-        for (let i = 0; i <= months; i += 1) {
+        for (let i = 0; i <= months; i++) {
           const month = finalMonthToFetchMoment.clone().subtract(i, 'months');
-          const monthData = await fetchPostWithinPage<CardTransactionDetails | CardTransactionDetailsError>(
-            this.page,
+          const monthData = await fetchPost(
             TRANSACTIONS_REQUEST_ENDPOINT,
             { cardUniqueId: card.cardUniqueId, month: month.format('M'), year: month.format('YYYY') },
             {
               Authorization,
               'X-Site-Id': xSiteId,
               'Content-Type': 'application/json',
+              ...apiHeaders,
             },
           );
 
@@ -479,7 +524,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
           pendingData = null;
         }
 
-        const transactions = convertParsedDataToTransactions(allMonthsData, pendingData);
+        const transactions = convertParsedDataToTransactions(allMonthsData, pendingData, this.options);
 
         debug('filter out old transactions');
         const txns =
@@ -489,6 +534,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
         return {
           txns,
+          balance: frame?.nextTotalDebit != null ? -frame.nextTotalDebit : undefined,
           accountNumber: card.last4Digits,
         } as TransactionsAccount;
       }),

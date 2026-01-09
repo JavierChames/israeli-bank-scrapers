@@ -1,4 +1,3 @@
-import buildUrl from 'build-url';
 import moment, { type Moment } from 'moment';
 import { type Page } from 'puppeteer';
 import { DOLLAR_CURRENCY, EURO_CURRENCY, SHEKEL_CURRENCY } from '../constants';
@@ -42,7 +41,7 @@ export interface ScrapedTransaction {
 const BASE_API_ACTIONS_URL = 'https://onlinelcapi.max.co.il';
 const BASE_WELCOME_URL = 'https://www.max.co.il';
 
-const LOGIN_URL = `${BASE_WELCOME_URL}/homepage/welcome`;
+const LOGIN_URL = `${BASE_WELCOME_URL}/login`;
 const PASSWORD_EXPIRED_URL = `${BASE_WELCOME_URL}/renew-password`;
 const SUCCESS_URL = `${BASE_WELCOME_URL}/homepage/personal`;
 
@@ -95,9 +94,13 @@ function getTransactionsUrl(monthMoment: Moment) {
    * cardIndex: -1 for all cards under the account
    * all other query params are static, beside the date which changes for request per month
    */
-  return buildUrl(BASE_API_ACTIONS_URL, {
-    path: `/api/registered/transactionDetails/getTransactionsAndGraphs?filterData={"userIndex":-1,"cardIndex":-1,"monthView":true,"date":"${date}","dates":{"startDate":"0","endDate":"0"},"bankAccount":{"bankAccountIndex":-1,"cards":null}}&firstCallCardIndex=-1`,
-  });
+  const url = new URL(`${BASE_API_ACTIONS_URL}/api/registered/transactionDetails/getTransactionsAndGraphs`);
+  url.searchParams.set(
+    'filterData',
+    `{"userIndex":-1,"cardIndex":-1,"monthView":true,"date":"${date}","dates":{"startDate":"0","endDate":"0"},"bankAccount":{"bankAccountIndex":-1,"cards":null}}`,
+  );
+  url.searchParams.set('firstCallCardIndex', '-1');
+  return url.toString();
 }
 
 interface FetchCategoryResult {
@@ -197,7 +200,7 @@ export function getMemo({
   return comments;
 }
 
-function mapTransaction(rawTransaction: ScrapedTransaction): Transaction {
+function mapTransaction(rawTransaction: ScrapedTransaction, options?: ScraperOptions): Transaction {
   const isPending = rawTransaction.paymentDate === null;
   const processedDate = moment(isPending ? rawTransaction.purchaseDate : rawTransaction.paymentDate).toISOString();
   const status = isPending ? TransactionStatuses.Pending : TransactionStatuses.Completed;
@@ -207,7 +210,7 @@ function mapTransaction(rawTransaction: ScrapedTransaction): Transaction {
     ? `${rawTransaction.dealData?.arn}_${installments.number}`
     : rawTransaction.dealData?.arn;
 
-  return {
+  const result: Transaction = {
     type: getTransactionType(rawTransaction.planName, rawTransaction.planTypeId),
     date: moment(rawTransaction.purchaseDate).toISOString(),
     processedDate,
@@ -222,6 +225,12 @@ function mapTransaction(rawTransaction: ScrapedTransaction): Transaction {
     identifier,
     status,
   };
+
+  if (options?.includeRawTransaction) {
+    result.rawTransaction = rawTransaction;
+  }
+
+  return result;
 }
 interface ScrapedTransactionsResult {
   result?: {
@@ -229,7 +238,7 @@ interface ScrapedTransactionsResult {
   };
 }
 
-async function fetchTransactionsForMonth(page: Page, monthMoment: Moment) {
+async function fetchTransactionsForMonth(page: Page, monthMoment: Moment, options?: ScraperOptions) {
   const url = getTransactionsUrl(monthMoment);
 
   const data = await fetchGetWithinPage<ScrapedTransactionsResult>(page, url);
@@ -245,7 +254,7 @@ async function fetchTransactionsForMonth(page: Page, monthMoment: Moment) {
         transactionsByAccount[transaction.shortCardNumber] = [];
       }
 
-      const mappedTransaction = mapTransaction(transaction);
+      const mappedTransaction = mapTransaction(transaction, options);
       transactionsByAccount[transaction.shortCardNumber].push(mappedTransaction);
     });
 
@@ -292,7 +301,7 @@ async function fetchTransactions(page: Page, options: ScraperOptions) {
 
   let allResults: Record<string, Transaction[]> = {};
   for (let i = 0; i < allMonths.length; i += 1) {
-    const result = await fetchTransactionsForMonth(page, allMonths[i]);
+    const result = await fetchTransactionsForMonth(page, allMonths[i], options);
     allResults = addResult(allResults, result);
   }
 
