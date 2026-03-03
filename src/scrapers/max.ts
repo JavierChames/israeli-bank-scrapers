@@ -6,7 +6,12 @@ import { getDebug } from '../helpers/debug';
 import { clickButton, elementPresentOnPage, waitUntilElementFound } from '../helpers/elements-interactions';
 import { fetchGetWithinPage } from '../helpers/fetch';
 import { waitForRedirect } from '../helpers/navigation';
-import { filterOldTransactions, fixInstallments, sortTransactionsByDate } from '../helpers/transactions';
+import {
+  filterOldTransactions,
+  fixInstallments,
+  sortTransactionsByDate,
+  getRawTransaction,
+} from '../helpers/transactions';
 import { TransactionStatuses, TransactionTypes, type Transaction } from '../transactions';
 import {
   BaseScraperWithBrowser,
@@ -68,6 +73,7 @@ enum MaxPlanName {
   EarlyRepayment = 'פרעון מוקדם',
   MonthlyCardFee = 'דמי כרטיס',
   CurrencyPocket = 'חיוב ארנק מטח',
+  MonthlyChargeDistribution = 'חלוקת חיוב חודשי',
 }
 
 const INVALID_DETAILS_SELECTOR = '#popupWrongDetails';
@@ -141,6 +147,7 @@ function getTransactionType(planName: string, planTypeId: number) {
     case MaxPlanName.EarlyRepayment:
     case MaxPlanName.MonthlyCardFee:
     case MaxPlanName.CurrencyPocket:
+    case MaxPlanName.MonthlyChargeDistribution:
       return TransactionTypes.Normal;
     case MaxPlanName.Installments:
     case MaxPlanName.Credit:
@@ -227,7 +234,7 @@ function mapTransaction(rawTransaction: ScrapedTransaction, options?: ScraperOpt
   };
 
   if (options?.includeRawTransaction) {
-    result.rawTransaction = rawTransaction;
+    result.rawTransaction = getRawTransaction(rawTransaction);
   }
 
   return result;

@@ -13,6 +13,7 @@ import { type Transaction, TransactionStatuses, TransactionTypes, type Transacti
 import { BaseScraperWithBrowser, LoginResults, type PossibleLoginResults } from './base-scraper-with-browser';
 import { ScraperErrorTypes } from './errors';
 import { getDebug } from '../helpers/debug';
+import { getRawTransaction } from '../helpers/transactions';
 import { type ScraperOptions } from './interface';
 
 const debug = getDebug('mizrahi');
@@ -198,6 +199,16 @@ function createHeadersFromRequest(request: HTTPRequest) {
   };
 }
 
+function getTransactionIdentifier(row: ScrapedTransaction): string | number | undefined {
+  if (!row.MC02AsmahtaMekoritEZ) {
+    return undefined;
+  }
+  if (row.TransactionNumber && String(row.TransactionNumber) !== '1') {
+    return `${row.MC02AsmahtaMekoritEZ}-${row.TransactionNumber}`;
+  }
+  return parseInt(row.MC02AsmahtaMekoritEZ, 10);
+}
+
 async function convertTransactions(
   txns: ScrapedTransaction[],
   getMoreDetails: (row: ScrapedTransaction) => Promise<MoreDetails>,
@@ -212,7 +223,7 @@ async function convertTransactions(
 
       const result: Transaction = {
         type: TransactionTypes.Normal,
-        identifier: row.MC02AsmahtaMekoritEZ ? parseInt(row.MC02AsmahtaMekoritEZ, 10) : undefined,
+        identifier: getTransactionIdentifier(row),
         date: txnDate,
         processedDate: txnDate,
         originalAmount: row.MC02SchumEZ,
@@ -227,7 +238,10 @@ async function convertTransactions(
       };
 
       if (options?.includeRawTransaction) {
-        result.rawTransaction = row;
+        result.rawTransaction = getRawTransaction({
+          ...row,
+          additionalInformation: moreDetails.entries,
+        });
       }
 
       return result;

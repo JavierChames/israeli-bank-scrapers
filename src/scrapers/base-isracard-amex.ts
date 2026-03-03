@@ -6,7 +6,7 @@ import { ScraperProgressTypes } from '../definitions';
 import getAllMonthMoments from '../helpers/dates';
 import { getDebug } from '../helpers/debug';
 import { fetchGetWithinPage, fetchPostWithinPage } from '../helpers/fetch';
-import { filterOldTransactions, fixInstallments } from '../helpers/transactions';
+import { filterOldTransactions, fixInstallments, getRawTransaction } from '../helpers/transactions';
 import { runSerial, sleep } from '../helpers/waiting';
 import {
   TransactionStatuses,
@@ -239,7 +239,7 @@ function convertTransactions(
     };
 
     if (options?.includeRawTransaction) {
-      result.rawTransaction = txn;
+      result.rawTransaction = getRawTransaction(txn);
     }
 
     return result;
@@ -327,6 +327,7 @@ async function getExtraScrapTransaction(
   return {
     ...transaction,
     category: rawCategory.trim(),
+    rawTransaction: getRawTransaction(data, transaction),
   };
 }
 
