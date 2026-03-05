@@ -245,13 +245,19 @@ interface ScrapedTransactionsResult {
   };
 }
 
+interface BillingInfo {
+  billingSum: number;
+  billingDate: string;
+}
+
 async function fetchTransactionsForMonth(page: Page, monthMoment: Moment, options?: ScraperOptions) {
   const url = getTransactionsUrl(monthMoment);
 
   const data = await fetchGetWithinPage<ScrapedTransactionsResult>(page, url);
   const transactionsByAccount: Record<string, Transaction[]> = {};
+  const billingInfoByAccount: Record<string, BillingInfo> = {};
 
-  if (!data || !data.result) return transactionsByAccount;
+  if (!data || !data.result) return { transactionsByAccount, billingInfoByAccount };
 
   data.result.transactions
     // Filter out non-transactions without a plan type, e.g. summary rows
@@ -263,9 +269,25 @@ async function fetchTransactionsForMonth(page: Page, monthMoment: Moment, option
 
       const mappedTransaction = mapTransaction(transaction, options);
       transactionsByAccount[transaction.shortCardNumber].push(mappedTransaction);
+
+      // Accumulate billing sum per card from actualPaymentAmount
+      const paymentAmount = Math.abs(parseFloat(transaction.actualPaymentAmount) || 0);
+      if (paymentAmount > 0) {
+        if (!billingInfoByAccount[transaction.shortCardNumber]) {
+          billingInfoByAccount[transaction.shortCardNumber] = {
+            billingSum: 0,
+            billingDate: transaction.paymentDate || monthMoment.toISOString(),
+          };
+        }
+        billingInfoByAccount[transaction.shortCardNumber].billingSum += paymentAmount;
+        // Use the latest payment date for this card
+        if (transaction.paymentDate) {
+          billingInfoByAccount[transaction.shortCardNumber].billingDate = transaction.paymentDate;
+        }
+      }
     });
 
-  return transactionsByAccount;
+  return { transactionsByAccount, billingInfoByAccount };
 }
 
 function addResult(allResults: Record<string, Transaction[]>, result: Record<string, Transaction[]>) {
@@ -277,6 +299,18 @@ function addResult(allResults: Record<string, Transaction[]>, result: Record<str
     clonedResults[accountNumber].push(...result[accountNumber]);
   });
   return clonedResults;
+}
+
+function addBillingInfo(
+  allBillingInfo: Record<string, BillingInfo>,
+  newBillingInfo: Record<string, BillingInfo>,
+) {
+  const cloned = { ...allBillingInfo };
+  Object.keys(newBillingInfo).forEach(accountNumber => {
+    // Always keep the latest (most future) billing info
+    cloned[accountNumber] = newBillingInfo[accountNumber];
+  });
+  return cloned;
 }
 
 function prepareTransactions(
@@ -307,9 +341,11 @@ async function fetchTransactions(page: Page, options: ScraperOptions) {
   await loadCategories(page);
 
   let allResults: Record<string, Transaction[]> = {};
+  let allBillingInfo: Record<string, BillingInfo> = {};
   for (let i = 0; i < allMonths.length; i += 1) {
-    const result = await fetchTransactionsForMonth(page, allMonths[i], options);
-    allResults = addResult(allResults, result);
+    const { transactionsByAccount, billingInfoByAccount } = await fetchTransactionsForMonth(page, allMonths[i], options);
+    allResults = addResult(allResults, transactionsByAccount);
+    allBillingInfo = addBillingInfo(allBillingInfo, billingInfoByAccount);
   }
 
   Object.keys(allResults).forEach(accountNumber => {
@@ -323,7 +359,7 @@ async function fetchTransactions(page: Page, options: ScraperOptions) {
     allResults[accountNumber] = txns;
   });
 
-  return allResults;
+  return { allResults, allBillingInfo };
 }
 
 function getPossibleLoginResults(page: Page): PossibleLoginResults {
@@ -380,11 +416,16 @@ class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
   }
 
   async fetchData() {
-    const results = await fetchTransactions(this.page, this.options);
-    const accounts = Object.keys(results).map(accountNumber => {
+    const { allResults, allBillingInfo } = await fetchTransactions(this.page, this.options);
+    const accounts = Object.keys(allResults).map(accountNumber => {
+      const billing = allBillingInfo[accountNumber];
       return {
         accountNumber,
-        txns: results[accountNumber],
+        txns: allResults[accountNumber],
+        // @ts-ignore - custom billing metadata (same pattern as base-isracard-amex and visa-cal)
+        nextBillingSum: billing ? String(billing.billingSum.toFixed(2)) : undefined,
+        // @ts-ignore
+        nextBillingDate: billing?.billingDate,
       };
     });
 

@@ -64,3 +64,12 @@ lib/
 .idea
 .vscode
 .DS_Store
+
+# App files (belong to israel-scraper app repo, not this library)
+scraper.js
+importer.js
+db_config.json
+excluded_accounts.json
+json_files/
+log_scraper.log
+transaction_import_*.log

@@ -231,8 +231,8 @@ async function hasInvalidPasswordError(page: Page) {
   const errorFound = await elementPresentOnPage(frame, 'div.general-error > div');
   const errorMessage = errorFound
     ? await pageEval(frame, 'div.general-error > div', '', item => {
-        return (item as HTMLDivElement).innerText;
-      })
+      return (item as HTMLDivElement).innerText;
+    })
     : '';
   return errorMessage === InvalidPasswordMessage;
 }
@@ -300,9 +300,9 @@ function convertParsedDataToTransactions(
     const numOfPayments = isPending(transaction) ? transaction.numberOfPayments : transaction.numOfPayments;
     const installments = numOfPayments
       ? {
-          number: isPending(transaction) ? 1 : transaction.curPaymentNum,
-          total: numOfPayments,
-        }
+        number: isPending(transaction) ? 1 : transaction.curPaymentNum,
+        total: numOfPayments,
+      }
       : undefined;
 
     const date = moment(transaction.trnPurchaseDate);
@@ -367,7 +367,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     const initData = await waitUntil(
       () => getFromSessionStorage<InitResponse>(this.page, 'init'),
       'get init data in session storage',
-      10000,
+      20000,
       1000,
     );
     if (!initData) {
@@ -382,7 +382,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       const authModule = await waitUntil(
         async () => authModuleOrUndefined(await getFromSessionStorage<AuthModule>(this.page, 'auth-module')),
         'get authorization header with valid token in session storage',
-        10_000,
+        15000,
         50,
       );
       return `CALAuthScheme ${authModule.auth.calConnectToken}`;
@@ -532,10 +532,34 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
             ? filterOldTransactions(transactions, moment(startDate), this.options.combineInstallments || false)
             : transactions;
 
+        // Extract next billing info from the fetched month data
+        const allDebitInfo = allMonthsData
+          .flatMap(md => md.result.bankAccounts)
+          .flatMap(ba => ba.debitDates)
+          .filter(dd => dd.date)
+          .sort((a, b) => a.date.localeCompare(b.date));
+
+        const nextDebit = allDebitInfo.length > 0
+          ? allDebitInfo[allDebitInfo.length - 1]
+          : undefined;
+
+        const nextBillingDate = nextDebit?.date;
+        // Use Frames API nextTotalDebit (more accurate), fallback to debit dates total
+        const nextBillingSum = frame?.nextTotalDebit != null
+          ? String(Math.abs(frame.nextTotalDebit))
+          : nextDebit?.totalDebits?.length
+            ? String(Math.abs(
+              (nextDebit.totalDebits.find(td => td.currencySymbol === 'ILS') || nextDebit.totalDebits[0]).amount
+            ))
+            : undefined;
+
         return {
           txns,
-          balance: frame?.nextTotalDebit != null ? -frame.nextTotalDebit : undefined,
           accountNumber: card.last4Digits,
+          // @ts-ignore - custom billing metadata (same pattern as base-isracard-amex)
+          nextBillingSum,
+          // @ts-ignore
+          nextBillingDate,
         } as TransactionsAccount;
       }),
     );
