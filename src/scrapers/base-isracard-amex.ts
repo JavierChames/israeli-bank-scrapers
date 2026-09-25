@@ -23,7 +23,15 @@ import { interceptionPriorities, maskHeadlessUserAgent } from '../helpers/browse
 const RATE_LIMIT = {
   SLEEP_BETWEEN: 1000,
   TRANSACTIONS_BATCH_SIZE: 10,
+  // Per-transaction detail requests (PirteyIska_204) are sent one at a time with a
+  // randomized delay; bursts trigger Isracard's "Block Automation" (HTTP 429).
+  EXTRA_SCRAP_MIN_DELAY: 1200,
+  EXTRA_SCRAP_JITTER: 1300,
 } as const;
+
+interface ExtraScrapState {
+  blocked: boolean;
+}
 
 const COUNTRY_CODE = '212';
 const ID_TYPE = '1';
@@ -310,6 +318,7 @@ async function getExtraScrapTransaction(
   month: Moment,
   accountIndex: number,
   transaction: Transaction,
+  state: ExtraScrapState,
 ): Promise<Transaction> {
   const url = new URL(options.servicesUrl);
   url.searchParams.set('reqName', 'PirteyIska_204');
@@ -318,7 +327,19 @@ async function getExtraScrapTransaction(
   url.searchParams.set('moedChiuv', month.format('MMYYYY'));
 
   debug(`fetching extra scrap for transaction ${transaction.identifier} for month ${month.format('YYYY-MM')}`);
-  const data = await fetchGetWithinPage<ScrapedTransactionData>(page, url.toString());
+  let data: ScrapedTransactionData | null;
+  try {
+    data = await fetchGetWithinPage<ScrapedTransactionData>(page, url.toString());
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (message.includes('Block Automation') || message.includes('status: 429')) {
+      state.blocked = true;
+      debug('isracard blocked extra scrap requests (429), skipping remaining additional transaction information');
+    } else {
+      debug(`failed fetching extra scrap for transaction ${transaction.identifier}: ${message}`);
+    }
+    return transaction;
+  }
   if (!data) {
     return transaction;
   }
@@ -336,6 +357,7 @@ async function getExtraScrapAccount(
   options: CompanyServiceOptions,
   accountMap: ScrapedAccountsWithIndex,
   month: moment.Moment,
+  state: ExtraScrapState,
 ): Promise<ScrapedAccountsWithIndex> {
   const accounts: ScrapedAccountsWithIndex[string][] = [];
   for (const account of Object.values(accountMap)) {
@@ -344,13 +366,13 @@ async function getExtraScrapAccount(
       month.format('YYYY-MM'),
     );
     const txns: Transaction[] = [];
-    for (const txnsChunk of _.chunk(account.txns, RATE_LIMIT.TRANSACTIONS_BATCH_SIZE)) {
-      debug(`processing chunk of ${txnsChunk.length} transactions for account ${account.accountNumber}`);
-      const updatedTxns = await Promise.all(
-        txnsChunk.map(t => getExtraScrapTransaction(page, options, month, account.index, t)),
-      );
-      await sleep(RATE_LIMIT.SLEEP_BETWEEN);
-      txns.push(...updatedTxns);
+    for (const txn of account.txns) {
+      if (state.blocked) {
+        txns.push(txn);
+        continue;
+      }
+      txns.push(await getExtraScrapTransaction(page, options, month, account.index, txn, state));
+      await sleep(RATE_LIMIT.EXTRA_SCRAP_MIN_DELAY + Math.floor(Math.random() * RATE_LIMIT.EXTRA_SCRAP_JITTER));
     }
     accounts.push({ ...account, txns });
   }
@@ -371,7 +393,8 @@ async function getAdditionalTransactionInformation(
   ) {
     return accountsWithIndex;
   }
-  return runSerial(accountsWithIndex.map((a, i) => () => getExtraScrapAccount(page, options, a, allMonths[i])));
+  const state: ExtraScrapState = { blocked: false };
+  return runSerial(accountsWithIndex.map((a, i) => () => getExtraScrapAccount(page, options, a, allMonths[i], state)));
 }
 
 // UPDATE: Aggregates sums into metadata and adds them to final output
@@ -483,6 +506,7 @@ class IsracardAmexBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCred
     };
     debug('logging in with validate request');
     const validateResult = await fetchPostWithinPage<ScrapedLoginValidation>(this.page, validateUrl, validateRequest);
+    debug(`validate response: ${JSON.stringify(validateResult)}`);
     if (
       !validateResult ||
       !validateResult.Header ||
