@@ -12,7 +12,8 @@ import {
   sortTransactionsByDate,
   getRawTransaction,
 } from '../helpers/transactions';
-import { TransactionStatuses, TransactionTypes, type Transaction } from '../transactions';
+import { sleep } from '../helpers/waiting';
+import { TransactionStatuses, TransactionTypes, type Transaction, type TransactionsAccount } from '../transactions';
 import {
   BaseScraperWithBrowser,
   LoginResults,
@@ -45,6 +46,7 @@ export interface ScrapedTransaction {
 
 const BASE_API_ACTIONS_URL = 'https://onlinelcapi.max.co.il';
 const BASE_WELCOME_URL = 'https://www.max.co.il';
+const HOME_PAGE_DATA_URL = `${BASE_WELCOME_URL}/api/registered/getHomePageData`;
 
 const LOGIN_URL = `${BASE_WELCOME_URL}/login`;
 const PASSWORD_EXPIRED_URL = `${BASE_WELCOME_URL}/renew-password`;
@@ -78,6 +80,24 @@ enum MaxPlanName {
 
 const INVALID_DETAILS_SELECTOR = '#popupWrongDetails';
 const LOGIN_ERROR_SELECTOR = '#popupCardHoldersLoginError';
+
+interface HomePageCard {
+  Last4Digits: string;
+  CreditLimit: number | null;
+  OpenToBuy: number | null;
+  CycleSummary: Array<{
+    Date: string;
+    CurrencySymbol: string;
+  }>;
+}
+
+interface HomePageDataResult {
+  Result?: {
+    UserCards?: {
+      Cards?: HomePageCard[];
+    };
+  };
+}
 
 const categories = new Map<number, string>();
 
@@ -114,6 +134,29 @@ interface FetchCategoryResult {
     id: number;
     name: string;
   }>;
+}
+
+async function loadHomePageData(page: Page): Promise<Map<string, HomePageCard>> {
+  debug('Loading home page data for card balances');
+  const res = await fetchGetWithinPage<HomePageDataResult>(page, HOME_PAGE_DATA_URL);
+  const cardMap = new Map<string, HomePageCard>();
+  if (res?.Result?.UserCards?.Cards) {
+    for (const card of res.Result.UserCards.Cards) {
+      cardMap.set(card.Last4Digits, card);
+    }
+  }
+  return cardMap;
+}
+
+function getCardBalance(card: HomePageCard): number | undefined {
+  if (card.CreditLimit == null || card.OpenToBuy == null) return undefined;
+  const balance = -(card.CreditLimit - card.OpenToBuy);
+  return Math.round(balance * 100) / 100;
+}
+
+function getCardBalanceDate(card: HomePageCard): string | undefined {
+  const shekelEntry = card.CycleSummary?.find(entry => entry.CurrencySymbol.includes('₪'));
+  return shekelEntry ? shekelEntry.Date : undefined;
 }
 
 async function loadCategories(page: Page) {
@@ -301,10 +344,7 @@ function addResult(allResults: Record<string, Transaction[]>, result: Record<str
   return clonedResults;
 }
 
-function addBillingInfo(
-  allBillingInfo: Record<string, BillingInfo>,
-  newBillingInfo: Record<string, BillingInfo>,
-) {
+function addBillingInfo(allBillingInfo: Record<string, BillingInfo>, newBillingInfo: Record<string, BillingInfo>) {
   const cloned = { ...allBillingInfo };
   Object.keys(newBillingInfo).forEach(accountNumber => {
     // Always keep the latest (most future) billing info
@@ -339,11 +379,16 @@ async function fetchTransactions(page: Page, options: ScraperOptions) {
   const allMonths = getAllMonthMoments(startMoment, futureMonthsToScrape);
 
   await loadCategories(page);
+  const homePageCards = await loadHomePageData(page);
 
   let allResults: Record<string, Transaction[]> = {};
   let allBillingInfo: Record<string, BillingInfo> = {};
   for (let i = 0; i < allMonths.length; i += 1) {
-    const { transactionsByAccount, billingInfoByAccount } = await fetchTransactionsForMonth(page, allMonths[i], options);
+    const { transactionsByAccount, billingInfoByAccount } = await fetchTransactionsForMonth(
+      page,
+      allMonths[i],
+      options,
+    );
     allResults = addResult(allResults, transactionsByAccount);
     allBillingInfo = addBillingInfo(allBillingInfo, billingInfoByAccount);
   }
@@ -359,7 +404,7 @@ async function fetchTransactions(page: Page, options: ScraperOptions) {
     allResults[accountNumber] = txns;
   });
 
-  return { allResults, allBillingInfo };
+  return { allResults, allBillingInfo, homePageCards };
 }
 
 function getPossibleLoginResults(page: Page): PossibleLoginResults {
@@ -402,7 +447,13 @@ class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
         if (await elementPresentOnPage(this.page, '.login-link#private')) {
           await clickButton(this.page, '.login-link#private');
         }
-        await waitUntilElementFound(this.page, '#login-password-link', true);
+        // Try twice in case it can't find it the first time
+        try {
+          await waitUntilElementFound(this.page, '#login-password-link', true, 10000);
+        } catch {
+          await sleep(1000);
+          await waitUntilElementFound(this.page, '#login-password-link', true, 10000);
+        }
         await clickButton(this.page, '#login-password-link');
         await waitUntilElementFound(this.page, '#login-password.tab-pane.active app-user-login-form', true);
       },
@@ -416,12 +467,16 @@ class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
   }
 
   async fetchData() {
-    const { allResults, allBillingInfo } = await fetchTransactions(this.page, this.options);
-    const accounts = Object.keys(allResults).map(accountNumber => {
+    const { allResults, allBillingInfo, homePageCards } = await fetchTransactions(this.page, this.options);
+    const accounts: TransactionsAccount[] = Object.keys(allResults).map(accountNumber => {
+      const card = homePageCards.get(accountNumber);
       const billing = allBillingInfo[accountNumber];
       return {
         accountNumber,
         txns: allResults[accountNumber],
+        balance: card ? getCardBalance(card) : undefined,
+        balanceDate: card ? getCardBalanceDate(card) : undefined,
+        cardFrame: card?.CreditLimit ?? undefined,
         // @ts-ignore - custom billing metadata (same pattern as base-isracard-amex and visa-cal)
         nextBillingSum: billing ? String(billing.billingSum.toFixed(2)) : undefined,
         // @ts-ignore
