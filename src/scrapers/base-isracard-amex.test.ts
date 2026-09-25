@@ -1,4 +1,18 @@
-import { parseCardListBalances } from './base-isracard-amex';
+import moment from 'moment';
+import { type Page } from 'puppeteer';
+import { fetchGetWithinPage } from '../helpers/fetch';
+import { TransactionStatuses, TransactionTypes } from '../transactions';
+import { getAdditionalTransactionInformation, parseCardListBalances } from './base-isracard-amex';
+import { CompanyTypes } from '../definitions';
+
+jest.mock('../helpers/fetch', () => ({
+  ...jest.requireActual('../helpers/fetch'),
+  fetchGetWithinPage: jest.fn(),
+}));
+jest.mock('../helpers/waiting', () => ({
+  ...jest.requireActual('../helpers/waiting'),
+  sleep: jest.fn().mockResolvedValue(undefined),
+}));
 
 describe('parseCardListBalances', () => {
   test('parses card balance, balance date, and credit frame from the card-list page', () => {
@@ -85,5 +99,57 @@ describe('parseCardListBalances', () => {
       balance: 0,
       cardFrame: 0,
     });
+  });
+});
+
+describe('getAdditionalTransactionInformation', () => {
+  const txn = (identifier: number) => ({
+    type: TransactionTypes.Normal,
+    identifier,
+    date: '2026-09-01T00:00:00.000Z',
+    processedDate: '2026-10-02T00:00:00.000Z',
+    originalAmount: -10,
+    originalCurrency: 'ILS',
+    chargedAmount: -10,
+    description: `merchant ${identifier}`,
+    status: TransactionStatuses.Completed,
+  });
+  const accounts = [{ '1234': { accountNumber: '1234', index: 0, txns: [txn(1), txn(2)] } }];
+  const serviceOptions = { servicesUrl: 'https://example.test/services', companyCode: '11', cardListPageUrl: '' };
+
+  beforeEach(() => {
+    (fetchGetWithinPage as jest.Mock).mockReset().mockResolvedValue({ PirteyIska_204Bean: { sector: 'Food ' } });
+  });
+
+  test('skips detail requests for transactions listed in additionalTransactionInformationSkipIds', async () => {
+    const [result] = await getAdditionalTransactionInformation(
+      {
+        companyId: CompanyTypes.isracard,
+        startDate: new Date('2026-09-01'),
+        additionalTransactionInformation: true,
+        additionalTransactionInformationSkipIds: ['1'],
+      },
+      accounts,
+      {} as Page,
+      serviceOptions,
+      [moment('2026-09-01')],
+    );
+
+    expect(fetchGetWithinPage).toHaveBeenCalledTimes(1);
+    expect((fetchGetWithinPage as jest.Mock).mock.calls[0][1]).toContain('shovarRatz=2');
+    expect(result['1234'].txns[0].category).toBeUndefined();
+    expect(result['1234'].txns[1].category).toBe('Food');
+  });
+
+  test('requests details for every transaction when no skip list is given', async () => {
+    await getAdditionalTransactionInformation(
+      { companyId: CompanyTypes.isracard, startDate: new Date('2026-09-01'), additionalTransactionInformation: true },
+      accounts,
+      {} as Page,
+      serviceOptions,
+      [moment('2026-09-01')],
+    );
+
+    expect(fetchGetWithinPage).toHaveBeenCalledTimes(2);
   });
 });

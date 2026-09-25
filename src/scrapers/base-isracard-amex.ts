@@ -30,6 +30,7 @@ const RATE_LIMIT = {
 
 interface ExtraScrapState {
   blocked: boolean;
+  skipIds: Set<string>;
 }
 
 const COUNTRY_CODE = '212';
@@ -469,7 +470,7 @@ async function getExtraScrapAccount(
     );
     const txns: Transaction[] = [];
     for (const txn of account.txns) {
-      if (state.blocked) {
+      if (state.blocked || state.skipIds.has(String(txn.identifier))) {
         txns.push(txn);
         continue;
       }
@@ -482,7 +483,7 @@ async function getExtraScrapAccount(
   return accounts.reduce((m, x) => ({ ...m, [x.accountNumber]: x }), {});
 }
 
-async function getAdditionalTransactionInformation(
+export async function getAdditionalTransactionInformation(
   scraperOptions: ScraperOptions,
   accountsWithIndex: ScrapedAccountsWithIndex[],
   page: Page,
@@ -495,7 +496,10 @@ async function getAdditionalTransactionInformation(
   ) {
     return accountsWithIndex;
   }
-  const state: ExtraScrapState = { blocked: false };
+  const state: ExtraScrapState = {
+    blocked: false,
+    skipIds: new Set((scraperOptions.additionalTransactionInformationSkipIds ?? []).map(String)),
+  };
   return runSerial(accountsWithIndex.map((a, i) => () => getExtraScrapAccount(page, options, a, allMonths[i], state)));
 }
 

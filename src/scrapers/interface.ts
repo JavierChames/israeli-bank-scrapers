@@ -148,6 +148,13 @@ export type ScraperOptions = ScraperBrowserOptions & {
   additionalTransactionInformation?: boolean;
 
   /**
+   * Identifiers of transactions whose additional information was already fetched in an earlier run.
+   * Their detail request is skipped, keeping the request count low: Isracard/Amex answer bursts
+   * of detail requests with "Block Automation" (HTTP 429).
+   */
+  additionalTransactionInformationSkipIds?: Array<string | number>;
+
+  /**
    * Include the raw transaction object as received from the scraper source for debugging purposes.
    * @default false
    */
